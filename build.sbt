@@ -6,7 +6,7 @@
  * You may obtain a copy of the License at
  *
  * http://www.apache.org/licenses/LICENSE-2.0
-
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -37,9 +37,6 @@ libraryDependencies ++= Seq(
   "org.apache.spark" %% "spark-core" % sparkVersion.value % "test" classifier "tests",
   "org.apache.spark" %% "spark-sql" % sparkVersion.value % "test" classifier "tests"
 )
-
-resolvers += "Apache Spark 2.4.2-rc1 Repo" at
-  "https://repository.apache.org/content/repositories/orgapachespark-1322"
 
 testOptions in Test += Tests.Argument("-oF")
 
@@ -136,3 +133,17 @@ bintrayReleaseOnPublish in ThisBuild := false
 bintrayOrganization := Some("delta-io")
 
 bintrayRepository := "delta"
+
+import ReleaseTransformations._
+
+releaseProcess := Seq[ReleaseStep](
+  checkSnapshotDependencies,
+  inquireVersions,
+  runTest,
+  setReleaseVersion,
+  commitReleaseVersion,
+  tagRelease,
+  publishArtifacts,
+  setNextVersion,
+  commitNextVersion
+)
