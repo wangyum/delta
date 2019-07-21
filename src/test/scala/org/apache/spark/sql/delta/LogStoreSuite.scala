@@ -19,6 +19,8 @@ package org.apache.spark.sql.delta
 import java.io.{File, IOException}
 import java.net.URI
 
+import org.apache.spark.sql.delta.DeltaOperations.ManualUpdate
+import org.apache.spark.sql.delta.actions.AddFile
 import org.apache.spark.sql.delta.storage._
 import org.apache.hadoop.fs.{Path, RawLocalFileSystem}
 
@@ -26,11 +28,20 @@ import org.apache.spark.sql.QueryTest
 import org.apache.spark.sql.test.SharedSQLContext
 import org.apache.spark.util.Utils
 
-class LogStoreSuite
-  extends QueryTest
+abstract class LogStoreSuiteBase extends QueryTest
   with LogStoreProvider
-  
   with SharedSQLContext {
+
+  def logStoreClassName: String
+
+  protected override def sparkConf = {
+    super.sparkConf.set(logStoreClassConfKey, logStoreClassName)
+  }
+
+  test("instantiation through SparkConf") {
+    assert(spark.sparkContext.getConf.get(logStoreClassConfKey) == logStoreClassName)
+    assert(LogStore(spark.sparkContext).getClass.getName == logStoreClassName)
+  }
 
   test("read / write") {
     val tempDir = Utils.createTempDir()
@@ -76,28 +87,71 @@ class LogStoreSuite
     assert(store.listFrom(deltas(4)).map(_.getPath.getName).toArray === Nil)
   }
 
-  test("should pick up the session Hadoop configuration") {
+  test("simple log store test") {
     val tempDir = Utils.createTempDir()
-    val path = new Path(new URI(s"fake://${tempDir.toURI.getRawPath}/1.json"))
+    val log1 = DeltaLog(spark, new Path(tempDir.getCanonicalPath))
+    assert(log1.store.getClass.getName == logStoreClassName)
 
-    val (fsImplConf, fsImplClass, errMsg) = {
-        (
-          "fs.AbstractFileSystem.fake.impl",
-          classOf[FakeAbstractFileSystem],
-          "No AbstractFileSystem for scheme: fake"
-        )
-    }
+    val txn = log1.startTransaction()
+    val file = AddFile("1", Map.empty, 1, 1, true) :: Nil
+    txn.commit(file, ManualUpdate)
+    log1.checkpoint()
 
-    // Make sure it will fail without FakeFileSystem
-    val e = intercept[IOException] {
-      createLogStore(spark).listFrom(path)
-    }
-    assert(e.getMessage.contains(errMsg))
+    DeltaLog.clearCache()
+    val log2 = DeltaLog(spark, new Path(tempDir.getCanonicalPath))
+    assert(log2.store.getClass.getName == logStoreClassName)
 
-    withSQLConf(fsImplConf -> fsImplClass.getName) {
-      createLogStore(spark).listFrom(path)
+    assert(log2.lastCheckpoint.map(_.version) === Some(0L))
+    assert(log2.snapshot.allFiles.count == 1)
+  }
+
+  protected def testHadoopConf(expectedErrMsg: String, fsImplConfs: (String, String)*): Unit = {
+    test("should pick up fs impl conf from session Hadoop configuration") {
+      withTempDir { tempDir =>
+        val path = new Path(new URI(s"fake://${tempDir.toURI.getRawPath}/1.json"))
+
+        // Make sure it will fail without FakeFileSystem
+        val e = intercept[IOException] {
+          createLogStore(spark).listFrom(path)
+        }
+        assert(e.getMessage.contains(expectedErrMsg))
+
+        withSQLConf(fsImplConfs: _*) {
+          createLogStore(spark).listFrom(path)
+        }
+      }
     }
   }
+}
+
+class AzureLogStoreSuite extends LogStoreSuiteBase {
+
+  override val logStoreClassName: String = classOf[AzureLogStore].getName
+
+  testHadoopConf(
+    expectedErrMsg = "No FileSystem for scheme: fake",
+    "fs.fake.impl" -> classOf[FakeFileSystem].getName,
+    "fs.fake.impl.disable.cache" -> "true")
+}
+
+class HDFSLogStoreSuite extends LogStoreSuiteBase {
+
+  override val logStoreClassName: String = classOf[HDFSLogStore].getName
+  // HDFSLogStore is based on FileContext APIs and hence requires AbstractFileSystem-based
+  // implementations.
+  testHadoopConf(
+    expectedErrMsg = "No AbstractFileSystem",
+    "fs.AbstractFileSystem.fake.impl" -> classOf[FakeAbstractFileSystem].getName)
+}
+
+class LocalLogStoreSuite extends LogStoreSuiteBase {
+
+  override val logStoreClassName: String = classOf[LocalLogStore].getName
+
+  testHadoopConf(
+    expectedErrMsg = "No FileSystem for scheme: fake",
+    "fs.fake.impl" -> classOf[FakeFileSystem].getName,
+    "fs.fake.impl.disable.cache" -> "true")
 }
 
 /** A fake file system to test whether session Hadoop configuration will be picked up. */

@@ -16,6 +16,7 @@
 
 package org.apache.spark.sql.delta
 
+// scalastyle:off import.ordering.noEmptyLine
 import java.io.FileNotFoundException
 import java.util.ConcurrentModificationException
 
@@ -46,7 +47,6 @@ trait DocsPath {
  */
 object DeltaErrors
     extends DocsPath
-    
     with DeltaLogging {
 
   def baseDocsPath(spark: SparkSession): String = baseDocsPath(spark.sparkContext.getConf)
@@ -81,6 +81,9 @@ object DeltaErrors
 
   def formatSchema(schema: StructType): String = schema.treeString
 
+  def analysisException(msg: String, plan: Option[LogicalPlan]): AnalysisException = {
+    new AnalysisException(msg, plan = plan)
+  }
 
   def notNullInvariantException(invariant: Invariant): Throwable = {
     new InvariantViolationException(s"Column ${UnresolvedAttribute(invariant.column).name}" +
@@ -92,6 +95,7 @@ object DeltaErrors
     new AnalysisException("Specifying static partitions in the partition spec is" +
       " currently not supported during inserts")
   }
+
 
   def operationNotSupportedException(
       operation: String, tableIdentifier: TableIdentifier): Throwable = {
@@ -605,6 +609,15 @@ abstract class DeltaConcurrentModificationException(message: String)
 }
 
 /**
+ * Thrown when a concurrent transaction has written data after the current transaction read the
+ * table.
+ */
+class ConcurrentWriteException(
+    conflictingCommit: Option[CommitInfo]) extends DeltaConcurrentModificationException(
+  s"A concurrent transaction has written new data since the current transaction " +
+    s"read the table. Please try the operation again.", conflictingCommit)
+
+/**
  * Thrown when the metadata of the Delta table has changed between the time of read
  * and the time of commit.
  */
@@ -625,9 +638,10 @@ class ProtocolChangedException(
 /** Thrown when files are added that would have been read by the current transaction. */
 class ConcurrentAppendException(
     conflictingCommit: Option[CommitInfo],
-    partition: String) extends DeltaConcurrentModificationException(
+    partition: String,
+    customRetryMsg: Option[String] = None) extends DeltaConcurrentModificationException(
   s"Files were added to $partition by a concurrent update. " +
-    "Please try the operation again.", conflictingCommit)
+    customRetryMsg.getOrElse("Please try the operation again."), conflictingCommit)
 
 /** Thrown when the current transaction reads data that was deleted by a concurrent transaction. */
 class ConcurrentDeleteReadException(

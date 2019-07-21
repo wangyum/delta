@@ -22,8 +22,8 @@ import java.util.concurrent.{Callable, TimeUnit}
 import java.util.concurrent.locks.ReentrantLock
 
 import scala.concurrent.{ExecutionContext, Future}
-
-
+import scala.util.Try
+import scala.util.control.NonFatal
 
 import com.databricks.spark.util.TagDefinitions._
 import org.apache.spark.sql.delta.actions._
@@ -33,15 +33,12 @@ import org.apache.spark.sql.delta.metering.DeltaLogging
 import org.apache.spark.sql.delta.schema.SchemaUtils
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.spark.sql.delta.storage.LogStoreProvider
-
 import com.google.common.cache.{CacheBuilder, RemovalListener, RemovalNotification}
 import org.apache.hadoop.fs.Path
 
 import org.apache.spark.SparkContext
 import org.apache.spark.sql._
-import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.analysis.{Resolver, UnresolvedAttribute}
-import org.apache.spark.sql.catalyst.catalog.CatalogTable
 import org.apache.spark.sql.catalyst.expressions.{And, Attribute, Expression, In, InSet, Literal}
 import org.apache.spark.sql.catalyst.plans.logical.AnalysisHelper
 import org.apache.spark.sql.execution.datasources._
@@ -61,13 +58,8 @@ class DeltaLog private(
     val dataPath: Path,
     val clock: Clock)
   extends Checkpoints
-  
-  
   with MetadataCleanup
-  
   with LogStoreProvider
-  
-  
   with VerifyChecksum {
 
   import org.apache.spark.sql.delta.util.FileNames._
@@ -213,7 +205,7 @@ class DeltaLog private(
     } else {
       if (asyncUpdateTask == null || asyncUpdateTask.isCompleted) {
         val jobGroup = spark.sparkContext.getLocalProperty(SparkContext.SPARK_JOB_GROUP_ID)
-          asyncUpdateTask = Future[Unit] {
+        asyncUpdateTask = Future[Unit] {
           spark.sparkContext.setLocalProperty("spark.scheduler.pool", "deltaStateUpdatePool")
           spark.sparkContext.setJobGroup(
             jobGroup,
@@ -358,7 +350,7 @@ class DeltaLog private(
   }
 
   /**
-   * Execute a piece of code within a new OptimisiticTransaction. Reads/write sets will
+   * Execute a piece of code within a new [[OptimisticTransaction]]. Reads/write sets will
    * be recorded for this table, and all other tables will be read
    * at a snapshot that is pinned on the first access.
    *
@@ -474,7 +466,7 @@ class DeltaLog private(
         "delta.protocol.failure.write",
         data = Map(
           "clientVersion" -> Action.writerVersion,
-          "minReaderVersion" -> currentSnapshot.protocol.minWriterVersion))
+          "minWriterVersion" -> currentSnapshot.protocol.minWriterVersion))
       throw new InvalidProtocolVersionException
     }
 
@@ -489,13 +481,18 @@ class DeltaLog private(
    * ------------------- */
 
   /** Get the snapshot at `version`. */
-  def getSnapshotAt(version: Long, commitTimestamp: Option[Long] = None): Snapshot = {
+  def getSnapshotAt(
+      version: Long,
+      commitTimestamp: Option[Long] = None,
+      lastCheckpointHint: Option[CheckpointInstance] = None): Snapshot = {
     val current = snapshot
     if (current.version == version) {
       return current
     }
 
-    val lastCheckpoint = findLastCompleteCheckpoint(CheckpointInstance(version, None))
+    // Do not use the hint if the version we're asking for is smaller than the last checkpoint hint
+    val lastCheckpoint = lastCheckpointHint.collect { case ci if ci.version <= version => ci }
+      .orElse(findLastCompleteCheckpoint(CheckpointInstance(version, None)))
     val lastCheckpointFiles = lastCheckpoint.map { c =>
       c.getCorrespondingFiles(logPath)
     }.toSeq.flatten
@@ -549,7 +546,6 @@ class DeltaLog private(
     }
   }
 
-
   /* ------------  *
    |  Integration  |
    * ------------  */
@@ -561,8 +557,9 @@ class DeltaLog private(
   def createDataFrame(
       snapshot: Snapshot,
       addFiles: Seq[AddFile],
-      isStreaming: Boolean = false): DataFrame = {
-    val actionType = if (isStreaming) "streaming" else "batch"
+      isStreaming: Boolean = false,
+      actionTypeOpt: Option[String] = None): DataFrame = {
+    val actionType = actionTypeOpt.getOrElse(if (isStreaming) "streaming" else "batch")
     val fileIndex = new TahoeBatchFileIndex(spark, actionType, addFiles, this, dataPath, snapshot)
 
     val relation = HadoopFsRelation(
@@ -634,8 +631,8 @@ object DeltaLog extends DeltaLogging {
    * We create only a single [[DeltaLog]] for any given path to avoid wasted work
    * in reconstructing the log.
    */
-  private val deltaLogCache =
-    CacheBuilder.newBuilder()
+  private val deltaLogCache = {
+    val builder = CacheBuilder.newBuilder()
       .expireAfterAccess(60, TimeUnit.MINUTES)
       .removalListener(new RemovalListener[Path, DeltaLog] {
         override def onRemoval(removalNotification: RemovalNotification[Path, DeltaLog]) = {
@@ -646,7 +643,11 @@ object DeltaLog extends DeltaLogging {
           }
         }
       })
-      .build[Path, DeltaLog]()
+    sys.props.get("delta.log.cacheSize")
+      .flatMap(v => Try(v.toLong).toOption)
+      .foreach(builder.maximumSize)
+    builder.build[Path, DeltaLog]()
+  }
 
   /** Helper for creating a log when it stored at the root of the data. */
   def forTable(spark: SparkSession, dataPath: String): DeltaLog = {
@@ -677,37 +678,6 @@ object DeltaLog extends DeltaLogging {
   def forTable(spark: SparkSession, dataPath: Path, clock: Clock): DeltaLog = {
     apply(spark, new Path(dataPath, "_delta_log"), clock)
   }
-
-  /** Helper for creating a log for the table. */
-  def forTable(spark: SparkSession, tableName: TableIdentifier): DeltaLog = {
-    forTable(spark, tableName, new SystemClock)
-  }
-
-  /** Helper for creating a log for the table. */
-  def forTable(spark: SparkSession, table: CatalogTable): DeltaLog = {
-    forTable(spark, table, new SystemClock)
-  }
-
-  /** Helper for creating a log for the table. */
-  def forTable(spark: SparkSession, tableName: TableIdentifier, clock: Clock): DeltaLog = {
-    val catalog = spark.sessionState.catalog
-    forTable(spark, catalog.getTableMetadata(tableName), clock)
-  }
-
-  /** Helper for creating a log for the table. */
-  def forTable(spark: SparkSession, table: CatalogTable, clock: Clock): DeltaLog = {
-    apply(spark, new Path(new Path(table.location), "_delta_log"), clock)
-  }
-
-  /** Helper for creating a log for the table. */
-  def forTable(spark: SparkSession, deltaTable: DeltaTableIdentifier): DeltaLog = {
-    if (deltaTable.path.isDefined) {
-      forTable(spark, deltaTable.path.get)
-    } else {
-      forTable(spark, deltaTable.table.get)
-    }
-  }
-
   // TODO: Don't assume the data path here.
   def apply(spark: SparkSession, rawPath: Path, clock: Clock = new SystemClock): DeltaLog = {
     val fs = rawPath.getFileSystem(spark.sessionState.newHadoopConf())
@@ -738,6 +708,18 @@ object DeltaLog extends DeltaLogging {
     } else {
       deltaLogCache.invalidate(path)
       apply(spark, path)
+    }
+  }
+
+  /** Invalidate the cached DeltaLog object for the given `dataPath`. */
+  def invalidateCache(spark: SparkSession, dataPath: Path): Unit = {
+    try {
+      val rawPath = new Path(dataPath, "_delta_log")
+      val fs = rawPath.getFileSystem(spark.sessionState.newHadoopConf())
+      val path = fs.makeQualified(rawPath)
+      deltaLogCache.invalidate(path)
+    } catch {
+      case NonFatal(e) => logWarning(e.getMessage, e)
     }
   }
 

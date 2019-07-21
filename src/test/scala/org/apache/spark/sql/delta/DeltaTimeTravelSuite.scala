@@ -24,7 +24,6 @@ import java.util.{Calendar, Date, TimeZone}
 import scala.concurrent.duration._
 import scala.language.implicitConversions
 
-
 import org.apache.spark.sql.delta.DeltaHistoryManager.BufferingLogDeletionIterator
 import org.apache.spark.sql.delta.actions.AddFile
 import org.apache.spark.sql.delta.util.FileNames
@@ -35,7 +34,8 @@ import org.apache.spark.sql.{AnalysisException, QueryTest, Row}
 import org.apache.spark.sql.test.SharedSQLContext
 import org.apache.spark.util.ManualClock
 
-class DeltaTimeTravelSuite extends QueryTest with SharedSQLContext {
+class DeltaTimeTravelSuite extends QueryTest
+  with SharedSQLContext {
 
   import testImplicits._
 
@@ -656,6 +656,30 @@ class DeltaTimeTravelSuite extends QueryTest with SharedSQLContext {
       checkAnswer(
         spark.read.format("delta").load(identifierWithVersion(tblLoc, 0)),
         spark.range(10).toDF())
+    }
+  }
+
+  test("time travel with partition changes - should instantiate old schema") {
+    withTempDir { dir =>
+      val tblLoc = dir.getCanonicalPath
+      val v0 = spark.range(10).withColumn("part5", 'id % 5)
+
+      v0.write.format("delta").partitionBy("part5").mode("append").save(tblLoc)
+      spark.range(10, 20).withColumn("part2", 'id % 2)
+        .write
+        .format("delta")
+        .partitionBy("part2")
+        .mode("overwrite")
+        .option("overwriteSchema", true)
+        .save(tblLoc)
+
+      checkAnswer(
+        spark.read.option("versionAsOf", 0).format("delta").load(tblLoc),
+        v0)
+
+      checkAnswer(
+        spark.read.format("delta").load(identifierWithVersion(tblLoc, 0)),
+        v0)
     }
   }
 }

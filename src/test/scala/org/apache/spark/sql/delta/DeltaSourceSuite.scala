@@ -16,24 +16,22 @@
 
 package org.apache.spark.sql.delta
 
-import java.io.{File, FileNotFoundException}
+import java.io.{File, FileInputStream, OutputStream}
 import java.net.URI
 import java.util.UUID
 
-
-
 import org.apache.spark.sql.delta.actions.{AddFile, Format}
 import org.apache.spark.sql.delta.sources.{DeltaSourceOffset, DeltaSQLConf}
-import org.apache.spark.sql.delta.util.FileNames
+import org.apache.spark.sql.delta.util.{FileNames, JsonUtils}
 import org.apache.commons.io.FileUtils
 import org.apache.hadoop.fs.{FileStatus, Path, RawLocalFileSystem}
 
-import org.apache.spark.sql.{AnalysisException, DataFrame, ForeachWriter, Row}
+import org.apache.spark.sql.{AnalysisException, DataFrame}
 import org.apache.spark.sql.execution.streaming._
 import org.apache.spark.sql.functions.lit
 import org.apache.spark.sql.streaming.{OutputMode, StreamingQueryException, StreamTest, Trigger}
 import org.apache.spark.sql.streaming.util.StreamManualClock
-import org.apache.spark.sql.types.{StringType, StructType}
+import org.apache.spark.sql.types.StructType
 import org.apache.spark.unsafe.types.CalendarInterval
 import org.apache.spark.util.{ManualClock, Utils}
 
@@ -633,6 +631,37 @@ class DeltaSourceSuite extends StreamTest {
         CheckLastBatch("3", "4")
       )
       assert(deltaLog.snapshot.version == 0)
+    }
+  }
+
+  test("Delta sources don't write offsets with null json") {
+    withTempDirs { (inputDir, outputDir, checkpointDir) =>
+      Seq(1, 2, 3).toDF("x").write.format("delta").save(inputDir.toString)
+
+      val df = spark.readStream.format("delta").load(inputDir.toString)
+      val stream = df.writeStream
+        .format("delta")
+        .option("checkpointLocation", checkpointDir.toString)
+        .start(outputDir.toString)
+      stream.processAllAvailable()
+      val offsetFile = checkpointDir.toString + "/offsets/0"
+
+      // Make sure JsonUtils doesn't serialize it as null
+      val deltaSourceOffsetLine =
+        scala.io.Source.fromFile(offsetFile).getLines.toSeq.last
+      val deltaSourceOffset = JsonUtils.fromJson[DeltaSourceOffset](deltaSourceOffsetLine)
+      assert(deltaSourceOffset.json != null, "Delta sources shouldn't write null json field")
+
+      // Make sure OffsetSeqLog won't choke on the offset we wrote
+      withTempDir { logPath =>
+        val seqLog = new OffsetSeqLog(spark, logPath.toString) {
+          val offsetSeq = this.deserialize(new FileInputStream(offsetFile))
+          val out = new OutputStream() { override def write(b: Int): Unit = { } }
+          this.serialize(offsetSeq, out)
+        }
+      }
+
+      stream.stop()
     }
   }
 }
